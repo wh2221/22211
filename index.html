@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>2221芜湖南瑞新城店营业额达成情况</title>
   <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+  <script src="https://imgcache.qq.com/qcloud/cloudbase-js-sdk/1.8.0/cloudbase.full.js"></script>
   <style>
     :root {
       --primary: #1a73e8;
@@ -591,17 +592,125 @@
 </div>
 
 <script>
-// ==================== DATA STORE ====================
-const STORAGE_KEY = 'store2221_records';
+// ==================== CloudBase 数据库初始化 ====================
+const TCB_ENV_ID = 'ai-native-d7gj4dic992fb85d1';
+const COLLECTION = 'store2221_records';
 const ADMIN_PW_KEY = 'store2221_admin_pw';
 
-function getRecords() {
+let tcbApp = null;
+let tcbDb = null;
+let tcbReady = false;
+let tcbAuth = null;
+let tcbLoginState = null;
+
+// 初始化 CloudBase（匿名登录，无需用户操作）
+async function initCloudBase() {
+  try {
+    tcbApp = cloudbase.init({ env: TCB_ENV_ID });
+    tcbAuth = tcbApp.auth({ persistence: 'local' });
+    
+    // 先尝试获取当前登录状态
+    tcbLoginState = await tcbAuth.getLoginState().catch(() => null);
+    
+    if (!tcbLoginState) {
+      // 匿名登录
+      await tcbAuth.anonymousAuthProvider().signIn();
+      tcbLoginState = await tcbAuth.getLoginState();
+    }
+    
+    tcbDb = tcbApp.database();
+    tcbReady = true;
+    console.log('✅ CloudBase 数据库已连接');
+  } catch (e) {
+    console.error('CloudBase 初始化失败，回退到本地存储:', e);
+    tcbReady = false;
+  }
+}
+
+// 立即初始化
+initCloudBase();
+
+// ==================== DATA STORE（云端优先 + 本地缓存兜底） ====================
+const STORAGE_KEY = 'store2221_records';
+
+// 本地缓存（作为云端加载失败时的兜底）
+let _localCache = [];
+function getLocalCache() {
   try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || []; }
   catch(e) { return []; }
 }
-
-function saveRecords(records) {
+function setLocalCache(records) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(records));
+}
+
+async function getRecords() {
+  // 优先从云端读取
+  if (tcbReady && tcbDb) {
+    try {
+      const res = await tcbDb.collection(COLLECTION)
+        .orderBy('createdAt', 'desc')
+        .limit(500)
+        .get();
+      if (res && res.data) {
+        const records = res.data.map(doc => {
+          const { _id, _openid, ...rest } = doc;
+          return { ...rest, _id };
+        });
+        // 同步到本地缓存
+        setLocalCache(records);
+        return records;
+      }
+    } catch (e) {
+      console.warn('云端读取失败，使用本地缓存:', e.message);
+    }
+  }
+  // 兜底：本地缓存
+  return getLocalCache();
+}
+
+async function saveRecords(records) {
+  // 先存本地缓存兜底
+  setLocalCache(records);
+}
+
+async function addRecordToCloud(record) {
+  if (tcbReady && tcbDb) {
+    try {
+      const res = await tcbDb.collection(COLLECTION).add(record);
+      if (res && res.id) {
+        record._id = res.id;
+        return true;
+      }
+    } catch (e) {
+      console.warn('云端保存失败:', e.message);
+    }
+  }
+  return false;
+}
+
+async function updateRecordInCloud(_id, record) {
+  if (tcbReady && tcbDb && _id) {
+    try {
+      const { _id: ignore, ...data } = record;
+      await tcbDb.collection(COLLECTION).doc(_id).set(data);
+      return true;
+    } catch (e) {
+      console.warn('云端更新失败:', e.message);
+    }
+  }
+  return false;
+}
+
+async function deleteRecordFromCloud(_id) {
+  if (tcbReady && tcbDb && _id) {
+    try {
+      await tcbDb.collection(COLLECTION).doc(_id).remove();
+      return true;
+    } catch (e) {
+      console.warn('云端删除失败:', e.message);
+    }
+  }
+  return false;
 }
 
 function getAdminPassword() {
@@ -659,7 +768,7 @@ function getSelectedShift() {
 }
 
 // ==================== SUBMIT RECORD ====================
-function submitRecord() {
+async function submitRecord() {
   const date = document.getElementById('recordDate').value;
   const shift = getSelectedShift();
   const reporter = document.getElementById('reporterName').value.trim();
@@ -685,18 +794,29 @@ function submitRecord() {
     createdAt: new Date().toISOString()
   };
 
-  const records = getRecords();
+  const records = await getRecords();
 
   // 检查是否已有相同日期+班次的记录，有则覆盖
   const existingIndex = records.findIndex(r => r.date === date && r.shift === shift);
+  let existingId = null;
   if (existingIndex >= 0) {
     if (!confirm(`${date} ${shift} 已有记录（${records[existingIndex].reporter} 填报），是否覆盖？`)) return;
-    record.id = records[existingIndex].id; // 保留原ID
+    record.id = records[existingIndex].id;
+    existingId = records[existingIndex]._id;
     records[existingIndex] = record;
   } else {
     records.unshift(record);
   }
+  
+  // 存本地缓存
   saveRecords(records);
+
+  // 存云端
+  if (existingId) {
+    await updateRecordInCloud(existingId, record);
+  } else {
+    await addRecordToCloud(record);
+  }
 
   // Show preview
   showPreview(record);
@@ -1019,8 +1139,8 @@ function getCurrentPreviewRecord() {
 }
 
 // ==================== HISTORY ====================
-function renderHistory() {
-  const records = getRecords();
+async function renderHistory() {
+  const records = await getRecords();
   const container = document.getElementById('historyList');
 
   if (records.length === 0) {
@@ -1050,8 +1170,8 @@ function renderHistory() {
   }).join('');
 }
 
-function viewRecordDetail(id) {
-  const records = getRecords();
+async function viewRecordDetail(id) {
+  const records = await getRecords();
   const record = records.find(r => r.id === id);
   if (!record) return;
 
@@ -1062,8 +1182,8 @@ function viewRecordDetail(id) {
 }
 
 // ==================== REPORT ====================
-function generateReport() {
-  const records = getRecords();
+async function generateReport() {
+  const records = await getRecords();
   if (records.length === 0) { showToast('暂无数据可生成简报'); return; }
 
   // Group by date
@@ -1159,8 +1279,8 @@ async function downloadReportImage() {
 }
 
 // ==================== CSV EXPORT ====================
-function exportCSV() {
-  const records = getRecords();
+async function exportCSV() {
+  const records = await getRecords();
   if (records.length === 0) { showToast('暂无数据可导出'); return; }
 
   const headers = ['日期', '班次', '填报人', '营业额(元)', '堂食(元)', '新零售', '饮料(杯)', '会员(个)', '提交时间'];
@@ -1194,10 +1314,10 @@ function adminLogin() {
   }
 }
 
-function renderAdmin() {
+async function renderAdmin() {
   if (document.getElementById('adminPanel').style.display === 'none') return;
 
-  const records = getRecords();
+  const records = await getRecords();
   let totalRevenueAll = 0, totalDineIn = 0, totalNewRetail = 0, totalBev = 0, totalMem = 0;
   records.forEach(r => {
     totalRevenueAll += r.totalRevenue;
@@ -1240,19 +1360,33 @@ function renderAdmin() {
   }
 }
 
-function deleteRecord(id) {
+async function deleteRecord(id) {
   if (!confirm('确定要删除这条记录吗？此操作不可恢复。')) return;
-  let records = getRecords();
+  let records = await getRecords();
+  const target = records.find(r => r.id === id);
   records = records.filter(r => r.id !== id);
   saveRecords(records);
+  
+  // 云端删除
+  if (target && target._id) {
+    await deleteRecordFromCloud(target._id);
+  }
+  
   renderAdmin();
   renderHistory();
   showToast('🗑️ 已删除');
 }
 
-function clearAllData() {
+async function clearAllData() {
   if (!confirm('⚠️ 确定要清空所有数据吗？此操作不可恢复！')) return;
   if (!confirm('再次确认：清空所有填报记录？')) return;
+  
+  // 云端逐条删除
+  const records = await getRecords();
+  for (const r of records) {
+    if (r._id) await deleteRecordFromCloud(r._id);
+  }
+  
   saveRecords([]);
   renderAdmin();
   renderHistory();
